@@ -28,8 +28,9 @@ MODEL_PROVIDER = "nvidia"
 BM25_CUR = BM25()
 
 
-def read_data(file_path: str):
-    # 读去pdf文档并提取文本信息
+def read_data(file_path: str, file: str):
+    print(f"[读取文件]：{file}")
+    # 读取pdf文档并提取文本信息
     loader = PyPDFLoader(
         file_path=file_path,
         extraction_mode="plain",
@@ -43,7 +44,8 @@ def read_data(file_path: str):
     return all_text
 
 
-def get_split_test(text):
+def get_split_test(text: str, file: str):
+    print(f"[分割文件信息]：{file}")
     # 对提取的问题呢进行分割
     recursive_splitter = RecursiveCharacterTextSplitter(
         chunk_size=200,
@@ -61,21 +63,25 @@ def split_pdf_file(dir_path: str):
         if not files:
             continue
         split_text = []
+        print("[开始处理数据]")
         for file in files:
             if not file.endswith(".pdf"):
                 raise EOFError("当前只支持pdf")
             file_path = os.path.join(root, file)
-            text = read_data(file_path)
-            split_cur_text = get_split_test(text)
+            text = read_data(file_path, file)
+            split_cur_text = get_split_test(text, file)
             split_text.extend(split_cur_text)
+        print("[完成数据读取与分割]")
         return split_text
 
 
 def text_to_faiss(split_text, embedding_model, faiss_db_path="faiss_index"):
     # faiss 向量检索器
     if os.path.exists(faiss_db_path):
+        print("[读取faiss数据]")
         faiss_db = FAISS.load_local(faiss_db_path, embedding_model, allow_dangerous_deserialization=True)
     else:
+        print("[制作faiss数据]")
         faiss_db = FAISS.from_texts(split_text, embedding_model)
         faiss_db.save_local(faiss_db_path)
 
@@ -83,18 +89,21 @@ def text_to_faiss(split_text, embedding_model, faiss_db_path="faiss_index"):
         search_type="mmr",
         search_kwargs={"k": 10, "score_threshold": 0.8}
     )
+    print("[完成数据向量化]")
     return faiss_retriever
 
 
-def text_to_bm25(split_text, bm25_db="bm_25_index"):
+def text_to_bm25(split_text=None, bm25_db="bm_25_index"):
     # BM25 关键词检索器
-    BM25s_Retriever = BM25sRetriever(bm25=BM25_CUR)
     if os.path.exists(bm25_db):
-        bm_25_db = BM25s_Retriever.load(bm25_db)
+        print("[读取bm25数据]")
+        bm_25_db = BM25sRetriever.load(bm25_db)
     else:
-        bm_25_db = BM25s_Retriever.from_texts(split_text)
+        print("[制作bm25数据]")
+        bm_25_db = BM25sRetriever.from_texts(split_text)
         bm_25_db.k = 10
         bm_25_db.save(bm25_db)
+    print("[完成数据分词后索引]")
     return bm_25_db
 
 
@@ -147,14 +156,14 @@ class LawRagAgent:
             system_prompt=self.system_prompt,
         )
 
-    def get_ensemble_retriever(self, file_dir="data", faiss_db_path="faiss_index", bm25_db="bm_25_index", ):
-        print("[分割文件]")
-        splitter = split_pdf_file(file_dir)
-        print("[制作bm25数据]")
-        bm_25_db = text_to_bm25(splitter, bm25_db)
-        print("[制作faiss数据]")
+    def get_ensemble_retriever(self, file_dir="data", faiss_db_path="faiss_index", bm25_db="bm_25_index"):
+        if os.path.exists(faiss_db_path) and os.path.exists(bm25_db):
+            splitter = []
+            bm_25_db = text_to_bm25(bm25_db=bm25_db)
+        else:
+            splitter = split_pdf_file(file_dir)
+            bm_25_db = text_to_bm25(splitter, bm25_db)
         faiss_retriever = text_to_faiss(splitter, self.embedding_model, faiss_db_path)
-        print("[完成embedding数据生成]")
 
         # 混合检索器
         ensemble_retriever = EnsembleRetriever(
@@ -164,19 +173,15 @@ class LawRagAgent:
         return ensemble_retriever
 
     def file_to_ensemble(self, file_dir="data", faiss_db_path="faiss_index", bm25_db="bm_25_index"):
-        print("[清除已有的embedding数据]")
+        print("[清除已有的数据]")
         if os.path.exists(faiss_db_path):
             shutil.rmtree(faiss_db_path, ignore_errors=True)
         if os.path.exists(bm25_db):
             shutil.rmtree(bm25_db, ignore_errors=True)
 
-        print("[分割文件]")
         splitter = split_pdf_file(file_dir)
-        print("[制作bm25数据]")
         bm_25_db = text_to_bm25(splitter, bm25_db)
-        print("[制作faiss数据]")
         faiss_retriever = text_to_faiss(splitter, self.embedding_model, faiss_db_path)
-        print("[完成embedding数据生成]")
 
         ensemble_retriever = EnsembleRetriever(
             retrievers=[faiss_retriever, bm_25_db],
@@ -230,10 +235,10 @@ class LawRagAgent:
 
 if __name__ == '__main__':
     law_agent = LawRagAgent()
-    # # 直接使用已有的embedding数据时使用，如果没有自动制作数据
-    # ensemble_retriever = law_agent.get_ensemble_retriever()
-    # 需要重新生成embedding数据时使用
-    ensemble_retriever = law_agent.file_to_ensemble()
+    # 直接使用已有的embedding数据时使用，如果没有自动制作数据
+    ensemble_retriever = law_agent.get_ensemble_retriever()
+    # # 需要重新生成embedding数据时使用
+    # ensemble_retriever = law_agent.file_to_ensemble()
     while True:
         q = input("输入你的问题:")
         law_agent.chat(q, ensemble_retriever)

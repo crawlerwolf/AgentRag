@@ -81,7 +81,7 @@ class BM25sRetriever(BaseRetriever):
         """
         os.makedirs(save_dir, exist_ok=True)
         # 保存 bm25s 索引
-        self.bm25.save(save_dir, corpus=self.corpus)
+        self.bm25.save(save_dir)
         # 保存元数据
         with open(os.path.join(save_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump({
@@ -98,6 +98,5 @@ class BM25sRetriever(BaseRetriever):
         with open(os.path.join(save_dir, "meta.json"), "r", encoding="utf-8") as f:
             meta = json.load(f)
         # 加载 bm25s 索引
-        bm25 = BM25()
-        bm25.load(save_dir, load_corpus=True)
+        bm25 = BM25.load(save_dir)
         return cls(k=meta["k"], bm25=bm25, corpus=meta["corpus"])
