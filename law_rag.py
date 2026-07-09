@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import hashlib
+import json
 import os
 import shutil
 
@@ -26,6 +28,18 @@ NVIDIA_CHAT_MODEL = os.getenv("NVIDIA_CHAT_MODEL")
 MODEL_PROVIDER = "nvidia"
 
 BM25_CUR = BM25()
+NUM_K = 10  # 获取条数
+
+
+def get_embed_model():
+    # embeding模型
+    embedding_model = NVIDIAEmbeddings(
+        model=NVIDIA_EMBEDDING_MODEL,
+        api_key=NVIDIA_API_KEY,
+        truncate="NONE",
+        dimensions=1024
+    )
+    return embedding_model
 
 
 def read_data(file_path: str, file: str):
@@ -62,7 +76,6 @@ def split_pdf_file(dir_path: str):
     for root, dirs, files in os.walk(dir_path):
         if not files:
             continue
-        split_text = []
         print("[开始处理数据]")
         for file in files:
             if not file.endswith(".pdf"):
@@ -70,53 +83,118 @@ def split_pdf_file(dir_path: str):
             file_path = os.path.join(root, file)
             text = read_data(file_path, file)
             split_cur_text = get_split_test(text, file)
-            split_text.extend(split_cur_text)
+            yield split_cur_text, file
         print("[完成数据读取与分割]")
-        return split_text
 
 
 def text_to_faiss(split_text, embedding_model, faiss_db_path="faiss_index"):
     # faiss 向量检索器
     if os.path.exists(faiss_db_path):
-        print("[读取faiss数据]")
-        faiss_db = FAISS.load_local(faiss_db_path, embedding_model, allow_dangerous_deserialization=True)
-    else:
-        print("[制作faiss数据]")
-        faiss_db = FAISS.from_texts(split_text, embedding_model)
-        faiss_db.save_local(faiss_db_path)
+        print("[faiss数据已存在]")
+        return None
+    print("[制作faiss数据]")
+    faiss_db = FAISS.from_texts(split_text, embedding_model)
+    faiss_db.save_local(faiss_db_path)
+    print("[完成数据向量化]")
 
+
+def make_faiss_data(file_dir_path: str, faiss_save_dir: str):
+    # 批量制作faiss数据
+    file_data_info_path = os.path.join(os.path.dirname(faiss_save_dir), "faiss_db_file_info.json")
+    if os.path.exists(file_data_info_path):
+        with open(file_data_info_path, "r", encoding="utf-8") as file_finish:
+            file_deal_data = json.loads(file_finish.read())
+    else:
+        file_deal_data = {}
+
+    splite_data = split_pdf_file(file_dir_path)
+    embedding_model = get_embed_model()
+
+    for split_cur_text, file in splite_data:
+        file_sha256 = hashlib.sha256(file.encode()).hexdigest().lower()
+        faiss_db_path = os.path.join(faiss_save_dir, file_sha256)
+        text_to_faiss(split_cur_text, embedding_model, faiss_db_path=faiss_db_path)
+        file_deal_data.update({file: faiss_db_path})
+
+    with open(file_data_info_path, "w", encoding="utf-8") as file_deal:
+        file_deal.write(json.dumps(file_deal_data, ensure_ascii=False))
+
+
+def get_faiss_data(faiss_save_dir: str):
+    if not os.path.isdir(faiss_save_dir):
+        raise Exception("当前地址不是文件夹，给出faiss数据库目录地址")
+
+    embedding_model = get_embed_model()
+    faiss_db_list = os.listdir(faiss_save_dir)
+    if not faiss_db_list:
+        raise Exception("当前文件夹为空")
+    faiss_db_path = os.path.join(faiss_save_dir, faiss_db_list[0])
+    faiss_db = FAISS.load_local(faiss_db_path, embedding_model, allow_dangerous_deserialization=True)
+    if len(faiss_db_list) > 1:
+        for faiss_db_ in faiss_db_list[1:]:
+            faiss_db_path_ = os.path.join(faiss_save_dir, faiss_db_)
+            faiss_db_ = FAISS.load_local(faiss_db_path_, embedding_model, allow_dangerous_deserialization=True)
+            faiss_db.merge_from(faiss_db_)
     faiss_retriever = faiss_db.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 10, "score_threshold": 0.8}
+        search_kwargs={"k": NUM_K, "score_threshold": 0.8}
     )
-    print("[完成数据向量化]")
     return faiss_retriever
 
 
 def text_to_bm25(split_text=None, bm25_db="bm_25_index"):
     # BM25 关键词检索器
     if os.path.exists(bm25_db):
-        print("[读取bm25数据]")
-        bm_25_db = BM25sRetriever.load(bm25_db)
-    else:
-        print("[制作bm25数据]")
-        bm_25_db = BM25sRetriever.from_texts(split_text)
-        bm_25_db.k = 10
-        bm_25_db.save(bm25_db)
+        print("[bm25数据数据已存在]")
+        return None
+    print("[制作bm25数据]")
+    bm_25_db = BM25sRetriever.from_texts(split_text)
+    bm_25_db.k = NUM_K
+    bm_25_db.save(bm25_db)
     print("[完成数据分词后索引]")
     return bm_25_db
+
+
+def make_bm25_data(file_dir_path: str, bm25_save_dir: str):
+    file_data_info_path = os.path.join(os.path.dirname(bm25_save_dir), "bm25_db_file_info.json")
+    if os.path.exists(file_data_info_path):
+        with open(file_data_info_path, "r", encoding="utf-8") as file_finish:
+            file_deal_data = json.loads(file_finish.read())
+    else:
+        file_deal_data = {}
+
+    splite_data = split_pdf_file(file_dir_path)
+
+    for split_cur_text, file in splite_data:
+        file_sha256 = hashlib.sha256(file.encode()).hexdigest().lower()
+        bm25_db_path = os.path.join(bm25_save_dir, file_sha256)
+        text_to_bm25(split_cur_text, bm25_db=bm25_db_path)
+        file_deal_data.update({file: bm25_db_path})
+
+    with open(file_data_info_path, "w", encoding="utf-8") as file_deal:
+        file_deal.write(json.dumps(file_deal_data, ensure_ascii=False))
+
+
+def get_bm25_data(bm25_save_dir: str):
+    if not os.path.isdir(bm25_save_dir):
+        raise Exception("当前地址不是文件夹，给出faiss数据库目录地址")
+
+    faiss_db_list = os.listdir(bm25_save_dir)
+    if not faiss_db_list:
+        raise Exception("当前文件夹为空")
+    bm25_list = []
+    for bm25_db_ in faiss_db_list:
+        bm25_db_path_ = os.path.join(bm25_save_dir, bm25_db_)
+        bm25_db = BM25sRetriever.load(bm25_db_path_)
+        bm25_list.append(bm25_db)
+
+    bm25_ensemble_retriever = EnsembleRetriever(retrievers=bm25_list)
+    return bm25_ensemble_retriever
 
 
 class LawRagAgent:
 
     def __init__(self, system_prompt=None):
-        # embeding模型
-        self.embedding_model = NVIDIAEmbeddings(
-            model=NVIDIA_EMBEDDING_MODEL,
-            api_key=NVIDIA_API_KEY,
-            truncate="NONE",
-            dimensions=1024
-        )
         # 重排序模型
         self.cross_encoder = NVIDIARerank(
             model=NVIDIA_RERANK_MODEL,
@@ -152,18 +230,16 @@ class LawRagAgent:
         # 智能体
         self.agent = create_agent(
             model=self.model,
-            tools=[],
             system_prompt=self.system_prompt,
         )
 
-    def get_ensemble_retriever(self, file_dir="data", faiss_db_path="faiss_index", bm25_db="bm_25_index"):
-        if os.path.exists(faiss_db_path) and os.path.exists(bm25_db):
-            splitter = []
-            bm_25_db = text_to_bm25(bm25_db=bm25_db)
-        else:
-            splitter = split_pdf_file(file_dir)
-            bm_25_db = text_to_bm25(splitter, bm25_db)
-        faiss_retriever = text_to_faiss(splitter, self.embedding_model, faiss_db_path)
+    def get_ensemble_retriever(self, file_dir="./data", faiss_db_dir="./faiss_db", bm25_db_dir="./bm25_db"):
+        if not os.path.exists(faiss_db_dir):
+            make_faiss_data(file_dir, faiss_db_dir)
+        if not os.path.exists(bm25_db_dir):
+            make_bm25_data(file_dir, bm25_db_dir)
+        faiss_retriever = get_faiss_data(faiss_db_dir)
+        bm_25_db = get_bm25_data(bm25_db_dir)
 
         # 混合检索器
         ensemble_retriever = EnsembleRetriever(
@@ -172,16 +248,17 @@ class LawRagAgent:
         )
         return ensemble_retriever
 
-    def file_to_ensemble(self, file_dir="data", faiss_db_path="faiss_index", bm25_db="bm_25_index"):
+    def file_to_ensemble(self, file_dir="./data", faiss_db_dir="./faiss_db", bm25_db_dir="./bm25_db"):
         print("[清除已有的数据]")
-        if os.path.exists(faiss_db_path):
-            shutil.rmtree(faiss_db_path, ignore_errors=True)
-        if os.path.exists(bm25_db):
-            shutil.rmtree(bm25_db, ignore_errors=True)
+        if os.path.exists(faiss_db_dir):
+            shutil.rmtree(faiss_db_dir, ignore_errors=True)
+        if os.path.exists(bm25_db_dir):
+            shutil.rmtree(bm25_db_dir, ignore_errors=True)
 
-        splitter = split_pdf_file(file_dir)
-        bm_25_db = text_to_bm25(splitter, bm25_db)
-        faiss_retriever = text_to_faiss(splitter, self.embedding_model, faiss_db_path)
+        make_faiss_data(file_dir, faiss_db_dir)
+        make_bm25_data(file_dir, bm25_db_dir)
+        faiss_retriever = get_faiss_data(faiss_db_dir)
+        bm_25_db = get_bm25_data(bm25_db_dir)
 
         ensemble_retriever = EnsembleRetriever(
             retrievers=[faiss_retriever, bm_25_db],
@@ -191,7 +268,7 @@ class LawRagAgent:
 
     def chat(self, query: str, ensemble_retriever):
         # 检索到的数据
-        retriever_doc = ensemble_retriever.invoke(query)
+        retriever_doc = ensemble_retriever.invoke(query)[:NUM_K*2]
 
         # 重排的数据
         advanced_retriever = self.cross_encoder.compress_documents(
@@ -217,7 +294,7 @@ class LawRagAgent:
         # 构造 Prompt
         user_prompt = f"""问题：
         {query}
-    
+
         上下文：
         {context}
         """

@@ -1,6 +1,10 @@
 # AgentRag
 将本地文件数据转化成faiss和MB25数据并保存。避免启动时重复生成。
 
+## 多数据库加载
+将faiss按照文件生成并保存，启动时直接读取每一个faiss文件库并合并。
+将bm25数据按照文成生成并保存，启动直接读取每一个bm25文件库使用EnsembleRetriever进行融合。
+
 ## 模型使用
 在NVIDIA[官网](https://build.nvidia.com/) 注册账号并添加api-key使用
 
