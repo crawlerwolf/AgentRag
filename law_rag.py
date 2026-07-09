@@ -66,7 +66,7 @@ def split_pdf_file(dir_path: str):
         print("[开始处理数据]")
         for file in files:
             if not file.endswith(".pdf"):
-                raise EOFError("当前只支持pdf")
+                raise Exception("当前只支持pdf")
             file_path = os.path.join(root, file)
             text = read_data(file_path, file)
             split_cur_text = get_split_test(text, file)

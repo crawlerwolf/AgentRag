@@ -17,3 +17,7 @@
 使用本地的RAG提取信息后
 <img width="1754" height="805" alt="image" src="https://github.com/user-attachments/assets/620416ae-cc4f-46bd-a97c-8837f7e4f2ff" />
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 2d480d5cc6268362f1331c117ba12005e8aab6aa
