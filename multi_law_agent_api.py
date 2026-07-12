@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from law_rag_harness import MultiLawAgent
+from multi_law_agent import MultiLawAgent
 
 # ---------- 日志配置 ----------
 logging.basicConfig(
@@ -30,9 +30,18 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    answer: str = Field(None, description="法律助手的回答")
-    thread_id: str = Field(None, description="使用的会话ID")
-    cached: bool = Field(False, description="是否命中历史缓存")
+    answer: str = Field(description="法律助手的回答")
+    thread_id: str = Field(description="使用的会话ID")
+    cached: bool = Field(description="是否命中历史缓存")
+
+
+class ClearRequest(BaseModel):
+    thread_id: str = Field(description="要清除的会话ID")
+
+
+class ClearResponse(BaseModel):
+    message: str
+    thread_id: str
 
 
 class HealthResponse(BaseModel):
@@ -48,7 +57,7 @@ async def lifespan(app: FastAPI):
     global law_agent
     logger.info("正在启动 LawRagAgent...")
     law_agent = MultiLawAgent()
-    law_agent.init_agent()  # 加载功能agent
+    await law_agent.init_agent()  # 加载功能agent
     # 初始化检索器（如果已有索引则加载，否则会尝试从 data/ 目录创建）
     await law_agent.init_retriever()
     logger.info("检索器初始化完成，API 服务就绪")
@@ -88,6 +97,21 @@ async def health_check():
         agent_ready=agent_ready,
         retriever_ready=retriever_ready,
     )
+
+
+@app.post("/clear_chat", response_model=ClearResponse)
+async def clear_session(req: ClearRequest):
+    """清除指定会话的所有检查点（包括子Agent的状态）"""
+    check_agent()
+
+    try:
+        await law_agent.clear_session(req.thread_id)
+        return ClearResponse(
+            message=f"会话 {req.thread_id} 已清除",
+            thread_id=req.thread_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"清除会话失败: {str(e)}")
 
 
 @app.post("/chat", response_model=ChatResponse)

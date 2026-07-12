@@ -5,6 +5,7 @@ import os
 import shutil
 from typing import TypedDict, Annotated, Sequence
 
+import aiosqlite
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
@@ -15,10 +16,15 @@ from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage, AIMessage, SystemMessage, HumanMessage
 
 # 加载环境变量
+from langchain_core.runnables import RunnableConfig
 from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings, NVIDIARerank
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.errors import NodeError
 from langgraph.graph import END, StateGraph
-from langgraph.types import RetryPolicy
+from langgraph.runtime import Runtime
+from langgraph.store.sqlite import AsyncSqliteStore
+from langgraph.types import RetryPolicy, Command
 
 from bm25s_retriever import BM25sRetriever
 
@@ -192,9 +198,10 @@ COMPLIANCE_REVIEW_PROMPT = """### 角色设定
 
 GENERAL_PROMPT = "你是法律助手，用友好语气回答以下问题："
 
+
 class MultiAgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]  # 对话历史
-    current_node: str  # 路由节点
+    next: str  # 路由节点
     query: str  # 用户的原始问题
 
 
@@ -224,30 +231,46 @@ class MultiLawAgent:
         self.retriever: EnsembleRetriever | None = None
         self._graph = None
 
-    def init_agent(self):
+        # 多角色agent
+        self.triage_agent = None
+        self.legal_research_agent = None
+        self.compliance_review_agent = None
+        self.general_agent = None
+
+        # 储存
+        self._checkpointer_conn = None
+        self.checkpointer = None
+
+    async def init_agent(self):
+        if self.checkpointer is None:
+            self.checkpointer = await self._get_async_checkpointer()
+
         self.triage_agent = create_agent(
             model=self.model,
             system_prompt=SystemMessage(
-                content=TRIAGE_PROMPT)
+                content=TRIAGE_PROMPT),
+            checkpointer=self.checkpointer
 
         )
         self.legal_research_agent = create_agent(
             model=self.model,
             system_prompt=SystemMessage(
-                content=LEGAL_RESEARCH_PROMPT)
+                content=LEGAL_RESEARCH_PROMPT),
+            checkpointer=self.checkpointer
 
         )
         self.compliance_review_agent = create_agent(
             model=self.model,
             system_prompt=SystemMessage(
-                content=COMPLIANCE_REVIEW_PROMPT)
+                content=COMPLIANCE_REVIEW_PROMPT),
+            checkpointer=self.checkpointer
 
         )
         self.general_agent = create_agent(
             model=self.model,
             system_prompt=SystemMessage(
-                content=GENERAL_PROMPT)
-
+                content=GENERAL_PROMPT),
+            checkpointer=self.checkpointer
         )
 
     async def init_retriever(self, data_dir="data", faiss_path="faiss_index", bm25_path="bm_25_index"):
@@ -297,15 +320,65 @@ class MultiLawAgent:
         blocks = [f"[片段{i}]\n{d.page_content}" for i, d in enumerate(ranked, 1)]
         return "\n\n".join(blocks)
 
+    async def _get_async_checkpointer(self):
+        """创建异步 SQLite checkpointer"""
+        db_path = os.getenv("CHECKPOINTS_DB_PATH", None)
+        is_first = False
+        if not db_path:
+            db_path = "./agent_db/agent_checkpoints.db"
+            os.makedirs("./agent_db", exist_ok=True)
+            is_first = True
+
+        self._checkpointer_conn = await aiosqlite.connect(db_path, check_same_thread=False)
+        checkpointer = AsyncSqliteSaver(self._checkpointer_conn)
+        if is_first:
+            await checkpointer.setup()
+        return checkpointer
+
+    async def close(self):
+        """关闭数据库连接，释放资源"""
+        if self._checkpointer_conn is not None:
+            await self._checkpointer_conn.close()
+            self.checkpointer = None
+
+    async def clear_session(self, thread_id: str):
+        """清除该会话下的主图和所有子 agent 的检查点"""
+        if not self._checkpointer_conn:
+            raise RuntimeError("Checkpointer 未初始化")
+
+        thread_id_list = [f"triage_{thread_id}", f"legal_research_{thread_id}", f"compliance_review_{thread_id}",
+                          f"general_{thread_id}", thread_id]
+        for thread_id_ in thread_id_list:
+            await self.checkpointer.adelete_thread(thread_id_)
+
+    def my_error_handler(self, state: dict, error: NodeError, runtime: Runtime):
+        # error.node 是失败节点名
+        attempt_number = runtime.execution_info.node_attempt
+        print(f"节点 '{error.node}' 失败: {error.error} 运行次数：'{attempt_number}'")
+        state["error_info"] = f"节点 {error.node} 失败"
+        # 返回 Command 跳转到节点
+        if error.node in ["legal_research", "compliance_review", "general"]:
+            return Command(
+                update=state,
+                goto="triage"  # 跳转到你定义的备用节点
+            )
+        return Command(
+            update=state,
+            goto=END  # 跳转到你定义的备用节点
+        )
+
     # ---------- LangGraph 节点 ----------
-    async def triage_node(self, state: MultiAgentState) -> dict:
+    async def triage_node(self, state: MultiAgentState, config: RunnableConfig) -> dict:
         """分流接待：分析用户最后一句话，决定下一节点"""
         user_msg = state["messages"][-1].content
         full_prompt = f"用户问题：{user_msg}\n输出："
+        thread_id = config["configurable"]["thread_id"]
+        user_id = config["configurable"]["user_id"]
+        triage_config = {"configurable": {"thread_id": f'triage_{thread_id}', "user_id": user_id}}
         response = await self.triage_agent.ainvoke(
-            {"messages": HumanMessage(content=full_prompt)}
+            {"messages": HumanMessage(content=full_prompt)},
+            triage_config
         )
-
         decision = response["messages"][-1].content.strip().lower()
         if decision not in ("legal_research", "compliance_review", "general"):
             decision = "general"
@@ -314,36 +387,54 @@ class MultiLawAgent:
         route_msg = AIMessage(content=f"[系统] 已分配至: {decision}")
         return {"messages": [route_msg], "next": decision, "query": user_msg}
 
-    async def legal_research_node(self, state: MultiAgentState) -> dict:
+    async def legal_research_node(self, state: MultiAgentState, config: RunnableConfig) -> dict:
         """法律研究 Agent：执行 RAG 并生成回答"""
         user_msg = state["query"]  # 原始问题
         context = await self._get_context(user_msg)
         full_prompt = f"问题：{user_msg}\n\n上下文：\n{context}"
+        thread_id = config["configurable"]["thread_id"]
+        user_id = config["configurable"]["user_id"]
+        legal_research_config = {"configurable": {"thread_id": f'legal_research_{thread_id}', "user_id": user_id}}
         response = await self.legal_research_agent.ainvoke(
-            {"messages": HumanMessage(content=full_prompt)}
+            {"messages": HumanMessage(content=full_prompt)},
+            legal_research_config
         )
-        return {"messages": [AIMessage(content=response["messages"][-1].content)], "next": END}
 
-    async def compliance_review_node(self, state: MultiAgentState) -> dict:
+        content = response["messages"][-1].content
+        return {"messages": [AIMessage(content=content)], "next": END}
+
+    async def compliance_review_node(self, state: MultiAgentState, config: RunnableConfig) -> dict:
         """合规审查 Agent：执行 RAG 并生成审查意见"""
         user_msg = state["query"]  # 原始问题
         context = await self._get_context(user_msg)
         full_prompt = f"待审材料/问题：{user_msg}\n\n上下文：\n{context}"
+        thread_id = config["configurable"]["thread_id"]
+        user_id = config["configurable"]["user_id"]
+        compliance_review_config = {"configurable": {"thread_id": f'compliance_review_{thread_id}', "user_id": user_id}}
         response = await self.compliance_review_agent.ainvoke(
-            {"messages": HumanMessage(content=full_prompt)}
+            {"messages": HumanMessage(content=full_prompt)},
+            compliance_review_config
         )
-        return {"messages": [AIMessage(content=response["messages"][-1].content)], "next": END}
 
-    async def general_node(self, state: MultiAgentState) -> dict:
+        content = response["messages"][-1].content
+        return {"messages": [AIMessage(content=content)], "next": END}
+
+    async def general_node(self, state: MultiAgentState, config: RunnableConfig) -> dict:
         """处理一般问题（简单回答）"""
         user_msg = state["query"]
+        thread_id = config["configurable"]["thread_id"]
+        user_id = config["configurable"]["user_id"]
+        general_config = {"configurable": {"thread_id": f'compliance_review_{thread_id}', "user_id": user_id}}
         response = await self.general_agent.ainvoke(
-            {"messages": HumanMessage(content=user_msg)}
+            {"messages": HumanMessage(content=user_msg)},
+            general_config
         )
-        return {"messages": [AIMessage(content=response["messages"][-1].content)], "next": END}
+
+        content = response["messages"][-1].content
+        return {"messages": [AIMessage(content=content)], "next": END}
 
     # ---------- 构建图 ----------
-    def build_graph(self):
+    async def build_graph(self):
         """构建 LangGraph 状态图"""
         workflow = StateGraph(MultiAgentState)
 
@@ -355,7 +446,9 @@ class MultiLawAgent:
                                 backoff_factor=2.0,  # 每次重试间隔指数增长
                                 max_interval=128.0,  # 最大重试间隔
                                 jitter=True  # 添加随机抖动，避免"惊群效应"
-                                )
+                                ),
+                          # timeout=30,
+                          error_handler=self.my_error_handler
                           )
         workflow.add_node("legal_research", self.legal_research_node,
                           retry_policy=RetryPolicy(
@@ -364,7 +457,9 @@ class MultiLawAgent:
                                 backoff_factor=2.0,  # 每次重试间隔指数增长
                                 max_interval=128.0,  # 最大重试间隔
                                 jitter=True  # 添加随机抖动，避免"惊群效应"
-                                )
+                                ),
+                          # timeout=30,
+                          error_handler=self.my_error_handler
                           )
         workflow.add_node("compliance_review", self.compliance_review_node,
                           retry_policy=RetryPolicy(
@@ -373,7 +468,9 @@ class MultiLawAgent:
                                 backoff_factor=2.0,  # 每次重试间隔指数增长
                                 max_interval=128.0,  # 最大重试间隔
                                 jitter=True  # 添加随机抖动，避免"惊群效应"
-                                )
+                                ),
+                          # timeout=30,
+                          error_handler=self.my_error_handler
                           )
         workflow.add_node("general", self.general_node,
                           retry_policy=RetryPolicy(
@@ -382,7 +479,9 @@ class MultiLawAgent:
                                 backoff_factor=2.0,  # 每次重试间隔指数增长
                                 max_interval=128.0,  # 最大重试间隔
                                 jitter=True  # 添加随机抖动，避免"惊群效应"
-                                )
+                                ),
+                          # timeout=30,
+                          error_handler=self.my_error_handler
                           )
 
         # 入口
@@ -400,41 +499,54 @@ class MultiLawAgent:
         )
 
         # 三个专家节点处理完后直接结束
-        workflow.add_edge("legal_research", "compliance_review")
+        workflow.add_edge("legal_research", END)
         workflow.add_edge("compliance_review", END)
         workflow.add_edge("general", END)
 
-        # 编译图（不带 checkpointer，需异步保存可加）
-        self._graph = workflow.compile()
+        # 编译图
+        if self.checkpointer is None:
+            self.checkpointer = await self._get_async_checkpointer()
+        self._graph = workflow.compile(
+            checkpointer=self.checkpointer,
+        )
 
-    async def get_message(self, user_input: str, thread_id: str = "default") -> str:
+    async def get_message(self, user_input: str, thread_id: str = "default", user_id: str = "default") -> str:
         """调用多 Agent 系统，返回最终回答"""
         if self._graph is None:
-            self.build_graph()
+            await self.build_graph()
+
+        config = {"configurable": {"thread_id": thread_id, "user_id": user_id}}
+
         # 输入状态
         state = {
             "messages": [HumanMessage(content=user_input)],
             "next": ""
         }
-        config = {"configurable": {"thread_id": thread_id}}
         result = await self._graph.ainvoke(state, config)
         # 最后一条 AI 消息即最终回答
         final_msg = result["messages"][-1].content
+
         return final_msg
 
 
 async def main():
     system = MultiLawAgent()
-    system.init_agent()  # 加载功能agent
+    await system.init_agent()  # 加载功能agent
     await system.init_retriever()
     print("多 Agent 法律系统就绪。输入问题，输入 exit 退出。")
-    thread_id = "default"
+
+    user_id = "1"
+    thread_id = "1"
     while True:
+
         q = input("输入你的问题:")
         if q.lower() == 'exit':
+            await system.clear_session(thread_id)
+            await system.close()
             break
-        answer = await system.get_message(q, thread_id)
+        answer = await system.get_message(q, thread_id, user_id)
         print(f"助手：{answer}\n")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
