@@ -44,7 +44,7 @@ MultiAgentState（图状态）
 ## 推荐安装步骤
 ```
 git clone <your-repo-url>
-cd multi-law-agent
+cd AgentRag
 pip install -r requirements.txt
 ```
 **requirements.txt**中应包含以下核心包（示例）：
